@@ -866,6 +866,55 @@ snapshot correlated-parenthesized-join-keeps-result-expressions {
       FROM nested_prune_outer AS outer_row;
 }
 
+setup left_join_grouped_expression_index_schema {
+    CREATE TABLE grouped_expr_left(x INTEGER);
+    CREATE TABLE grouped_expr_right(a INTEGER, b INTEGER);
+    CREATE INDEX grouped_expr_right_idx
+        ON grouped_expr_right(a,coalesce(b,7));
+}
+
+# The sorter stores the index value of coalesce(b,7) before GROUP BY.
+# For an unmatched LEFT JOIN row, b is NULL, so the sorter stores 7.
+@setup left_join_grouped_expression_index_schema
+snapshot left-join-group-by-keeps-expression-index-value {
+    SELECT grouped_expr_right.a,
+           sum(coalesce(grouped_expr_right.b,7))
+      FROM grouped_expr_left
+      LEFT JOIN grouped_expr_right INDEXED BY grouped_expr_right_idx
+        ON grouped_expr_right.a=grouped_expr_left.x
+     GROUP BY grouped_expr_right.a;
+}
+
+# The index stores coalesce(b,7), but it does not cover b: an unmatched
+# LEFT JOIN row computes coalesce(b,7) from the table column instead.
+@setup left_join_grouped_expression_index_schema
+@sqlite-reference
+snapshot left-join-expression-index-does-not-cover-null-row-columns {
+    SELECT grouped_expr_left.x, coalesce(grouped_expr_right.b,7)
+      FROM grouped_expr_left
+      LEFT JOIN grouped_expr_right INDEXED BY grouped_expr_right_idx
+        ON grouped_expr_right.a=grouped_expr_left.x;
+}
+
+setup left_join_null_range_schema {
+    CREATE TABLE null_range_left(seed INTEGER);
+    CREATE TABLE null_range_middle(key INTEGER NOT NULL);
+    CREATE TABLE null_range_right(value INTEGER);
+    CREATE INDEX null_range_right_value ON null_range_right(value);
+}
+
+# The first LEFT JOIN can make the declared NOT NULL key NULL. IsNull must stop
+# the later range seek before SeekGE reads that key.
+@setup left_join_null_range_schema
+snapshot left-join-range-seek-checks-null-extended-key {
+    SELECT null_range_left.seed, null_range_middle.key,
+           null_range_right.value
+      FROM null_range_left
+      LEFT JOIN null_range_middle ON true
+      LEFT JOIN null_range_right INDEXED BY null_range_right_value
+        ON null_range_middle.key<=null_range_right.value;
+}
+
 # =============================================================================
 # Hash Join Snapshot Tests
 # =============================================================================

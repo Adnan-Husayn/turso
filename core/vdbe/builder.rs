@@ -337,17 +337,18 @@ pub struct ProgramBuilder {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(transparent)]
-pub struct ProgramBuilderFlags(u8);
+pub struct ProgramBuilderFlags(u16);
 
 impl ProgramBuilderFlags {
-    const ROLLBACK: u8 = 1 << 0;
-    const IS_MULTI_WRITE: u8 = 1 << 1;
-    const MAY_ABORT: u8 = 1 << 2;
-    const READONLY: u8 = 1 << 3;
-    const IS_SUBPROGRAM: u8 = 1 << 4;
-    const HAS_STATEMENT_CONFLICT: u8 = 1 << 5;
-    const SUPPRESS_CUSTOM_TYPE_DECODE: u8 = 1 << 6;
-    const SUPPRESS_COLUMN_DEFAULT: u8 = 1 << 7;
+    const ROLLBACK: u16 = 1 << 0;
+    const IS_MULTI_WRITE: u16 = 1 << 1;
+    const MAY_ABORT: u16 = 1 << 2;
+    const READONLY: u16 = 1 << 3;
+    const IS_SUBPROGRAM: u16 = 1 << 4;
+    const HAS_STATEMENT_CONFLICT: u16 = 1 << 5;
+    const SUPPRESS_CUSTOM_TYPE_DECODE: u16 = 1 << 6;
+    const SUPPRESS_COLUMN_DEFAULT: u16 = 1 << 7;
+    const SKIP_EXPRESSION_INDEX_VALUES: u16 = 1 << 8;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
@@ -361,12 +362,12 @@ impl ProgramBuilderFlags {
     }
 
     #[inline]
-    const fn get(self, bit: u8) -> bool {
+    const fn get(self, bit: u16) -> bool {
         (self.0 & bit) != 0
     }
 
     #[inline]
-    const fn set(&mut self, bit: u8, value: bool) {
+    const fn set(&mut self, bit: u16, value: bool) {
         if value {
             self.0 |= bit;
         } else {
@@ -464,6 +465,17 @@ impl ProgramBuilderFlags {
     #[inline]
     pub const fn set_suppress_column_default(&mut self, v: bool) {
         self.set(Self::SUPPRESS_COLUMN_DEFAULT, v)
+    }
+
+    /// Whether expression translation must ignore selected expression indexes.
+    pub const fn skip_expression_index_values(self) -> bool {
+        self.get(Self::SKIP_EXPRESSION_INDEX_VALUES)
+    }
+
+    /// Set this while an `IfNullRow` fallback computes the original expression,
+    /// as SQLite clears `pIdxEpr`, so the same index match does not recur.
+    pub const fn set_skip_expression_index_values(&mut self, value: bool) {
+        self.set(Self::SKIP_EXPRESSION_INDEX_VALUES, value)
     }
 }
 
@@ -611,7 +623,7 @@ impl ProgramBuilderOpts {
 
 /// Use this macro to emit an OP_Explain instruction.
 /// Please use this macro instead of calling emit_explain() directly,
-/// because we want to avoid building the [EqpDetail] if we are not in explain mode.
+/// because we want to avoid building the `EqpDetail` if we are not in explain mode.
 #[macro_export]
 macro_rules! emit_explain {
     ($builder:expr, $push:expr, $detail:expr) => {
@@ -937,7 +949,7 @@ impl ProgramBuilder {
         &self.capture_data_changes_info
     }
 
-    /// Whether the main database uses MVCC journal mode. See [`Self::mvcc_enabled`].
+    /// Whether the main database uses MVCC journal mode. See `Self::mvcc_enabled`.
     pub const fn is_mvcc_enabled(&self) -> bool {
         self.mvcc_enabled
     }
@@ -990,7 +1002,7 @@ impl ProgramBuilder {
     }
 
     /// Get the index of the next constant span.
-    /// Used in [crate::translate::expr::translate_expr_no_constant_opt()] to invalidate
+    /// Used in `crate::translate::expr::translate_expr_no_constant_opt()` to invalidate
     /// all constant spans after the given index.
     pub const fn constant_spans_next_idx(&self) -> usize {
         self.constant_spans.len()
@@ -998,7 +1010,7 @@ impl ProgramBuilder {
 
     /// Invalidate all constant spans after the given index. This is used when we want to
     /// be sure that constant optimization is never used for translating a given expression.
-    /// See [crate::translate::expr::translate_expr_no_constant_opt()] for more details.
+    /// See `crate::translate::expr::translate_expr_no_constant_opt()` for more details.
     pub fn constant_spans_invalidate_after(&mut self, idx: usize) {
         self.constant_spans.truncate(idx);
     }
@@ -1695,6 +1707,9 @@ impl ProgramBuilder {
                 Insn::IsType { target_pc, .. } => {
                     resolve(target_pc, "IsType")?;
                 }
+                Insn::IfNullRow { target_pc, .. } => {
+                    resolve(target_pc, "IfNullRow")?;
+                }
                 Insn::ColumnHasField { target_pc, .. } => {
                     resolve(target_pc, "ColumnHasField")?;
                 }
@@ -1963,7 +1978,7 @@ impl ProgramBuilder {
         }
     }
 
-    /// Tries to mirror: https://github.com/sqlite/sqlite/blob/e77e589a35862f6ac9c4141cfd1beb2844b84c61/src/build.c#L5379
+    /// Tries to mirror: <https://github.com/sqlite/sqlite/blob/e77e589a35862f6ac9c4141cfd1beb2844b84c61/src/build.c#L5379>
     pub fn begin_write_operation(&mut self) -> Result<(), alloc::TryReserveError> {
         self.txn_mode = TransactionMode::Write;
         self.write_databases.set(crate::MAIN_DB_ID)

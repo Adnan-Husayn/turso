@@ -879,6 +879,38 @@ pub fn op_null_row(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_if_null_row(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        IfNullRow {
+            cursor_id,
+            target_pc,
+            dest
+        },
+        insn
+    );
+    if !target_pc.is_offset() {
+        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+    }
+    let cursor_is_null = state
+        .cursors
+        .get(*cursor_id)
+        .expect("cursor_id should be valid")
+        .as_ref()
+        .is_some_and(Cursor::get_null_flag);
+    if cursor_is_null {
+        state.registers[*dest].set_null();
+        state.pc = target_pc.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_compare(
     _program: &Program,
     state: &mut ProgramState,
@@ -4610,14 +4642,6 @@ pub fn op_transaction_inner(
             "Transaction instruction should not be used in trigger subprograms"
         );
     }
-    if *db == crate::TEMP_DB_ID {
-        program.connection.ensure_temp_database()?;
-    }
-    let pager = pager_for_db(program, pager, *db)?;
-    // Get the MvStore for the specific database (main or attached).
-    let mv_store = mv_store_for_db(program, state, *db);
-    let is_main_db = *db == crate::MAIN_DB_ID;
-    let is_secondary_db = !is_main_db;
     let write = matches!(
         tx_mode,
         TransactionMode::Write | TransactionMode::Concurrent
@@ -4627,6 +4651,26 @@ pub fn op_transaction_inner(
     // `write_databases` count for same-connection writer blocking and
     // active-writer cleanup.
     let statement_writes_db = program.write_databases.get(*db);
+    if *db == crate::TEMP_DB_ID {
+        // BEGIN IMMEDIATE / EXCLUSIVE / CONCURRENT emit a write Transaction for
+        // temp without touching it. Like SQLite (OP_Transaction is a no-op when
+        // the temp btree is not open), don't create the temp database just to
+        // lock it: it is private to this connection, so there is no lock to
+        // contend for. A later statement that uses temp creates it and begins
+        // its transaction lazily, exactly as after BEGIN DEFERRED. Creating it
+        // here would cost a temp file, a page 1 write and an fsync on every
+        // new connection, plus tearing it down on close.
+        if write && !statement_writes_db && !program.connection.has_temp_database() {
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+        program.connection.ensure_temp_database()?;
+    }
+    let pager = pager_for_db(program, pager, *db)?;
+    // Get the MvStore for the specific database (main or attached).
+    let mv_store = mv_store_for_db(program, state, *db);
+    let is_main_db = *db == crate::MAIN_DB_ID;
+    let is_secondary_db = !is_main_db;
     loop {
         match *state.active_op_state.transaction() {
             OpTransactionState::Start => {
@@ -6499,8 +6543,8 @@ pub enum OpSeekState {
     Start,
     /// Position cursor with seek operation with (rowid, op) search parameters
     Seek { key: OpSeekKey, op: SeekOp },
-    /// Advance cursor (with [BTreeCursor::next]/[BTreeCursor::prev] methods) which was
-    /// positioned after [OpSeekState::Seek] state if [BTreeCursor::seek] returned [SeekResult::TryAdvance]
+    /// Advance cursor (with `BTreeCursor::next`/`BTreeCursor::prev` methods) which was
+    /// positioned after [OpSeekState::Seek] state if `BTreeCursor::seek` returned [SeekResult::TryAdvance]
     Advance { op: SeekOp },
     /// Move cursor to the last BTree row if DB knows that comparison result will be fixed (due to type ordering, e.g. NUMBER always <= TEXT)
     MoveLast,
@@ -13918,6 +13962,9 @@ pub fn op_create_btree(
 
     if let Some(mv_store) = mv_store.as_ref() {
         let root_page = mv_store.get_next_table_id();
+        if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
+            mv_store.record_created_table_id(tx_id, root_page);
+        }
         state.registers[*root].set_int(root_page);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
@@ -20199,6 +20246,45 @@ mod tests {
         let version_integer = 3046001;
         let expected = "3.46.1";
         assert_eq!(execute_turso_version(version_integer), expected);
+    }
+
+    #[test]
+    fn if_null_row_does_nothing_for_unopened_cursor() {
+        let stmt = prepare_test_statement();
+        let mut state = ProgramState::new(1, 1);
+        state.set_register(0, Register::Value(Value::from_i64(7)));
+        let insn = Insn::IfNullRow {
+            cursor_id: 0,
+            target_pc: BranchOffset::Offset(9),
+            dest: 0,
+        };
+
+        let step = op_if_null_row(stmt.get_program(), &mut state, &insn, stmt.get_pager())
+            .expect("IfNullRow must accept an unopened cursor");
+
+        assert!(matches!(step, InsnFunctionStepResult::Step));
+        assert_eq!(state.pc, 1);
+        assert_eq!(state.get_register(0).get_value(), &Value::from_i64(7));
+    }
+
+    #[test]
+    fn if_null_row_clears_destination_and_jumps() {
+        let stmt = prepare_test_statement();
+        let mut state = ProgramState::new(1, 1);
+        state.cursors[0] = Some(Cursor::NullRow);
+        state.set_register(0, Register::Value(Value::from_i64(7)));
+        let insn = Insn::IfNullRow {
+            cursor_id: 0,
+            target_pc: BranchOffset::Offset(9),
+            dest: 0,
+        };
+
+        let step = op_if_null_row(stmt.get_program(), &mut state, &insn, stmt.get_pager())
+            .expect("IfNullRow must accept a null-row cursor");
+
+        assert!(matches!(step, InsnFunctionStepResult::Step));
+        assert_eq!(state.pc, 9);
+        assert_eq!(state.get_register(0).get_value(), &Value::Null);
     }
 
     #[test]
