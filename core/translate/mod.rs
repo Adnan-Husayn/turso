@@ -7,6 +7,7 @@
 //! a SELECT statement will be translated into a sequence of instructions that
 //! will read rows from the database and filter them according to a WHERE clause.
 
+pub(crate) mod access_control;
 pub(crate) mod aggregation;
 pub(crate) mod alter;
 pub(crate) mod analyze;
@@ -173,6 +174,7 @@ pub fn translate_inner(
             | ast::Stmt::CreateVirtualTable(..)
             | ast::Stmt::CreateType { .. }
             | ast::Stmt::CreateDomain { .. }
+            | ast::Stmt::CreateRole { .. }
             | ast::Stmt::Delete { .. }
             | ast::Stmt::DropIndex { .. }
             | ast::Stmt::DropTable { .. }
@@ -358,6 +360,9 @@ pub fn translate_inner(
             if_exists,
             view_name,
         } => view::translate_drop_view(resolver, &view_name, if_exists, program)?,
+        ast::Stmt::CreateRole { role_name } => {
+            access_control::translate_create_role(&role_name, resolver, program)?
+        }
         ast::Stmt::CreateType {
             if_not_exists,
             type_name,
@@ -534,6 +539,7 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::CreateVirtualTable(_) => "create_virtual_table",
         ast::Stmt::CreateType { .. } => "create_type",
         ast::Stmt::CreateDomain { .. } => "create_domain",
+        ast::Stmt::CreateRole { .. } => "create_role",
         ast::Stmt::Delete { .. } => "delete",
         ast::Stmt::Detach { .. } => "detach",
         ast::Stmt::DropIndex { .. } => "drop_index",
